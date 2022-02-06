@@ -1,0 +1,12 @@
+// Abuses function application to make an ergonomic list constructor
+// Cons, but simplifies Nil
+(Concat (Cons first last) end) = (Cons first (Concat last end))	  
+(Concat atom end) = (Cons atom end)
+
+(List) = @a(List_Internal_1 a)
+(List_Internal_1 Nil) = Nil
+(List_Internal_1 a) = @b(List_Internal_2 a b)
+(List_Internal_2 a Nil) = (Concat a Nil)
+(List_Internal_2 a b) = (List_Internal_1 (Concat a b))
+
+Main = ((List) 1 2 3 4 5 6 7 8 Nil) // Nil is necessary because the string representation of List_Internal_1 and 2 would be recursive otherwise
