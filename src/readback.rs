@@ -246,6 +246,7 @@ pub fn as_code(mem: &Worker, comp: &Option<rb::RuleBook>, host: u64) -> String {
   go(ctx, &mut stacks, term, 0)
 }
 
-pub fn as_term(mem: &Worker, comp: &Option<rb::RuleBook>, host: u64) -> Box<lang::Term> {
+pub fn as_term(mem: &Worker, comp: &Option<rb::RuleBook>, host: u64) -> Result<Box<lang::Term>, String> {
+  //println!("readback: {}", as_code(mem, comp, host));
   lang::read_term(&as_code(mem, comp, host))
 }

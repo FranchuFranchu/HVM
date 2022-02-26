@@ -1,36 +1,43 @@
 #![allow(clippy::identity_op)]
 
+use regex::Regex;
+use std::io::Write;
+use std::collections::{HashMap};
+
 use crate::builder as bd;
 use crate::language as lang;
 use crate::rulebook as rb;
 use crate::runtime as rt;
-use std::io::Write;
 
-pub fn compile_code_and_save(code: &str, file_name: &str) -> std::io::Result<()> {
-  let as_clang = compile_code(code);
+pub fn compile_code_and_save(code: &str, file_name: &str, parallel: bool) -> Result<(), String> {
+  let as_clang = compile_code(code, parallel)?;
   let mut file = std::fs::OpenOptions::new()
     .read(true)
     .write(true)
     .create(true)
     .truncate(true)
-    .open(file_name)?;
-  file.write_all(as_clang.as_bytes())?;
+    .open(file_name).map_err(|err| err.to_string())?;
+  file.write_all(as_clang.as_bytes()).map_err(|err| err.to_string())?;
   Ok(())
 }
 
-pub fn compile_code(code: &str) -> String {
-  let file = lang::read_file(code);
+fn compile_code(code: &str, parallel: bool) -> Result<String, String> {
+  let file = lang::read_file(code)?;
   let book = rb::gen_rulebook(&file);
-  let _funs = bd::build_runtime_functions(&book);
-  compile_book(&book)
+  bd::build_runtime_functions(&book);
+  Ok(compile_book(&book, parallel))
 }
 
-pub fn compile_name(name: &str) -> String {
-  str::replace(&format!("_{}_", name.to_uppercase()), ".", "$")
+fn compile_name(name: &str) -> String {
+  // TODO: this can still cause some name collisions.
+  // Note: avoiding the use of `$` because it is not an actually valid
+  // identifier character in C.
+  let name = name.replace("_", "__");
+  let name = name.replace(".", "_");
+  format!("_{}_", name.to_uppercase())
 }
 
-pub fn compile_book(comp: &rb::RuleBook) -> String {
-  let mut dups = 0;
+fn compile_book(comp: &rb::RuleBook, parallel: bool) -> String {
   let mut c_ids = String::new();
   let mut inits = String::new();
   let mut codes = String::new();
@@ -38,13 +45,13 @@ pub fn compile_book(comp: &rb::RuleBook) -> String {
   for (id, name) in &comp.id_to_name {
     line(&mut id2nm, 1, &format!(r#"id_to_name_data[{}] = "{}";"#, id, name));
   }
-  for (name, (_arity, rules)) in &comp.func_rules {
-    let (init, code) = compile_func(comp, rules, 7, &mut dups);
+  for (name, (_arity, rules)) in &comp.rule_group {
+    let (init, code) = compile_func(comp, rules, 7);
 
     line(
       &mut c_ids,
       0,
-      &format!("const u64 {} = {};", &compile_name(name), comp.name_to_id.get(name).unwrap_or(&0)),
+      &format!("#define {} ({})", &compile_name(name), comp.name_to_id.get(name).unwrap_or(&0)),
     );
 
     line(&mut inits, 6, &format!("case {}: {{", &compile_name(name)));
@@ -57,14 +64,13 @@ pub fn compile_book(comp: &rb::RuleBook) -> String {
     line(&mut codes, 6, "};");
   }
 
-  c_runtime_template(&c_ids, &inits, &codes, &id2nm, comp.id_to_name.len() as u64)
+  c_runtime_template(&c_ids, &inits, &codes, &id2nm, comp.id_to_name.len() as u64, parallel)
 }
 
-pub fn compile_func(
+fn compile_func(
   comp: &rb::RuleBook,
   rules: &[lang::Rule],
   tab: u64,
-  dups: &mut u64,
 ) -> (String, String) {
   let dynfun = bd::build_dynfun(comp, rules);
 
@@ -143,7 +149,7 @@ pub fn compile_func(
 
     // Builds the right-hand side term (ex: `(Succ (Add a b))`)
     //let done = compile_func_rule_body(&mut code, tab + 1, &dynrule.body, &dynrule.vars);
-    let done = compile_func_rule_term(&mut code, tab + 1, &dynrule.term, &dynrule.vars, dups);
+    let done = compile_func_rule_term(&mut code, tab + 1, &dynrule.term, &dynrule.vars);
     line(&mut code, tab + 1, &format!("u64 done = {};", done));
 
     // Links the host location to it
@@ -176,20 +182,40 @@ pub fn compile_func(
   (init, code)
 }
 
-pub fn compile_func_rule_term(
+fn compile_func_rule_term(
   code: &mut String,
   tab: u64,
   term: &bd::DynTerm,
   vars: &[bd::DynVar],
-  dups: &mut u64,
 ) -> String {
-  fn go(
+  fn alloc_lam(
     code: &mut String,
     tab: u64,
-    term: &bd::DynTerm,
+    nams: &mut u64,
+    globs: &mut HashMap<u64,String>,
+    glob: u64,
+  ) -> String {
+    if let Some(got) = globs.get(&glob) {
+      got.clone()
+    } else {
+      let name = fresh(nams, "lam");
+      line(code, tab, &format!("u64 {} = alloc(mem, 2);", name));
+      if glob != 0 {
+        // FIXME: sanitizer still can't detect if a scopeless lambda doesn't use its bound
+        // variable, so we must write an Era() here. When it does, we can remove this line.
+        line(code, tab, &format!("link(mem, {} + 0, Era());", name));
+        globs.insert(glob, name.clone());
+      }
+      name
+    }
+  }
+  fn compile_term(
+    code: &mut String,
+    tab: u64,
     vars: &mut Vec<String>,
     nams: &mut u64,
-    dups: &mut u64,
+    globs: &mut HashMap<u64,String>,
+    term: &bd::DynTerm,
   ) -> String {
     const INLINE_NUMBERS: bool = true;
     //println!("compile {:?}", term);
@@ -202,6 +228,9 @@ pub fn compile_func_rule_term(
           panic!("Unbound variable.");
         }
       }
+      bd::DynTerm::Glo { glob } => {
+        format!("Var({})", alloc_lam(code, tab, nams, globs, *glob))
+      }
       bd::DynTerm::Dup { eras, expr, body } => {
         //if INLINE_NUMBERS {
         //line(code, tab + 0, &format!("if (get_tag({}) == U32 && get_tag({}) == U32) {{", val0, val1));
@@ -210,7 +239,7 @@ pub fn compile_func_rule_term(
         let copy = fresh(nams, "cpy");
         let dup0 = fresh(nams, "dp0");
         let dup1 = fresh(nams, "dp1");
-        let expr = go(code, tab, expr, vars, nams, dups);
+        let expr = compile_term(code, tab, vars, nams, globs, expr);
         line(code, tab, &format!("u64 {} = {};", copy, expr));
         line(code, tab, &format!("u64 {};", dup0));
         line(code, tab, &format!("u64 {};", dup1));
@@ -223,10 +252,10 @@ pub fn compile_func_rule_term(
         }
         let name = fresh(nams, "dup");
         let coln = fresh(nams, "col");
-        let colx = *dups;
-        *dups += 1;
+        //let colx = *dups;
+        //*dups += 1;
         line(code, tab + 1, &format!("u64 {} = alloc(mem, 3);", name));
-        line(code, tab + 1, &format!("u64 {} = {};", coln, colx));
+        line(code, tab + 1, &format!("u64 {} = gen_dupk(mem);", coln));
         if eras.0 {
           line(code, tab + 1, &format!("link(mem, {} + 0, Era());", name));
         }
@@ -234,30 +263,29 @@ pub fn compile_func_rule_term(
           line(code, tab + 1, &format!("link(mem, {} + 1, Era());", name));
         }
         line(code, tab + 1, &format!("link(mem, {} + 2, {});", name, copy));
-        line(code, tab + 1, &format!("{} = Dp0({}, {});", dup0, colx, name));
-        line(code, tab + 1, &format!("{} = Dp1({}, {});", dup1, colx, name));
+        line(code, tab + 1, &format!("{} = Dp0({}, {});", dup0, coln, name));
+        line(code, tab + 1, &format!("{} = Dp1({}, {});", dup1, coln, name));
         if INLINE_NUMBERS {
           line(code, tab + 0, "}");
         }
         vars.push(dup0);
         vars.push(dup1);
-        let body = go(code, tab + 0, body, vars, nams, dups);
+        let body = compile_term(code, tab + 0, vars, nams, globs, body);
         vars.pop();
         vars.pop();
         body
       }
       bd::DynTerm::Let { expr, body } => {
-        let expr = go(code, tab, expr, vars, nams, dups);
+        let expr = compile_term(code, tab, vars, nams, globs, expr);
         vars.push(expr);
-        let body = go(code, tab, body, vars, nams, dups);
+        let body = compile_term(code, tab, vars, nams, globs, body);
         vars.pop();
         body
       }
-      bd::DynTerm::Lam { eras, body } => {
-        let name = fresh(nams, "lam");
-        line(code, tab, &format!("u64 {} = alloc(mem, 2);", name));
+      bd::DynTerm::Lam { eras, glob, body } => {
+        let name = alloc_lam(code, tab, nams, globs, *glob);
         vars.push(format!("Var({})", name));
-        let body = go(code, tab, body, vars, nams, dups);
+        let body = compile_term(code, tab, vars, nams, globs, body);
         vars.pop();
         if *eras {
           line(code, tab, &format!("link(mem, {} + 0, Era());", name));
@@ -267,8 +295,8 @@ pub fn compile_func_rule_term(
       }
       bd::DynTerm::App { func, argm } => {
         let name = fresh(nams, "app");
-        let func = go(code, tab, func, vars, nams, dups);
-        let argm = go(code, tab, argm, vars, nams, dups);
+        let func = compile_term(code, tab, vars, nams, globs, func);
+        let argm = compile_term(code, tab, vars, nams, globs, argm);
         line(code, tab, &format!("u64 {} = alloc(mem, 2);", name));
         line(code, tab, &format!("link(mem, {} + 0, {});", name, func));
         line(code, tab, &format!("link(mem, {} + 1, {});", name, argm));
@@ -276,7 +304,7 @@ pub fn compile_func_rule_term(
       }
       bd::DynTerm::Ctr { func, args } => {
         let ctr_args: Vec<String> =
-          args.iter().map(|arg| go(code, tab, arg, vars, nams, dups)).collect();
+          args.iter().map(|arg| compile_term(code, tab, vars, nams, globs, arg)).collect();
         let name = fresh(nams, "ctr");
         line(code, tab, &format!("u64 {} = alloc(mem, {});", name, ctr_args.len()));
         for (i, arg) in ctr_args.iter().enumerate() {
@@ -286,7 +314,7 @@ pub fn compile_func_rule_term(
       }
       bd::DynTerm::Cal { func, args } => {
         let cal_args: Vec<String> =
-          args.iter().map(|arg| go(code, tab, arg, vars, nams, dups)).collect();
+          args.iter().map(|arg| compile_term(code, tab, vars, nams, globs, arg)).collect();
         let name = fresh(nams, "cal");
         line(code, tab, &format!("u64 {} = alloc(mem, {});", name, cal_args.len()));
         for (i, arg) in cal_args.iter().enumerate() {
@@ -300,8 +328,8 @@ pub fn compile_func_rule_term(
       bd::DynTerm::Op2 { oper, val0, val1 } => {
         let retx = fresh(nams, "ret");
         let name = fresh(nams, "op2");
-        let val0 = go(code, tab, val0, vars, nams, dups);
-        let val1 = go(code, tab, val1, vars, nams, dups);
+        let val0 = compile_term(code, tab, vars, nams, globs, val0);
+        let val1 = compile_term(code, tab, vars, nams, globs, val1);
         line(code, tab + 0, &format!("u64 {};", retx));
         // Optimization: do inline operation, avoiding Op2 allocation, when operands are already number
         if INLINE_NUMBERS {
@@ -381,58 +409,8 @@ pub fn compile_func_rule_term(
       }
     })
     .collect();
-  go(code, tab, term, &mut vars, &mut nams, dups)
-}
-
-#[allow(dead_code)]
-// This isn't used, but it is an alternative way to compile right-hand side bodies. It results in
-// slightly different code that might be faster since it inlines many memory writes. But it doesn't
-// optimize numeric operations to avoid extra rules, so that may make it slower, depending.
-pub fn compile_func_rule_body(
-  code: &mut String,
-  tab: u64,
-  body: &bd::Body,
-  vars: &[bd::DynVar],
-) -> String {
-  let (elem, nodes) = body;
-  for (i, node) in nodes.iter().enumerate() {
-    line(code, tab + 0, &format!("u64 loc_{} = alloc(mem, {});", i, node.len()));
-  }
-  for (i, node) in nodes.iter().enumerate() {
-    for (j, element) in node.iter().enumerate() {
-      match element {
-        bd::Elem::Fix { value } => {
-          //mem.node[(host + j) as usize] = *value;
-          line(code, tab + 0, &format!("mem->node[loc_{} + {}] = {:#x}u;", i, j, value));
-        }
-        bd::Elem::Ext { index } => {
-          //rt::link(mem, host + j, get_var(mem, term, &vars[*index as usize]));
-          line(
-            code,
-            tab + 0,
-            &format!("link(mem, loc_{} + {}, {});", i, j, get_var(&vars[*index as usize])),
-          );
-          //line(code, tab + 0, &format!("u64 lnk = {};", get_var(&vars[*index as usize])));
-          //line(code, tab + 0, &format!("u64 tag = get_tag(lnk);"));
-          //line(code, tab + 0, &format!("mem.node[loc_{} + {}] = lnk;", i, j));
-          //line(code, tab + 0, &format!("if (tag <= VAR) mem.node[get_loc(lnk, tag & 1)] = Arg(loc_{} + {});", i, j));
-        }
-        bd::Elem::Loc { value, targ, slot } => {
-          //mem.node[(host + j) as usize] = value + hosts[*targ as usize] + slot;
-          line(
-            code,
-            tab + 0,
-            &format!("mem->node[loc_{} + {}] = {:#x}u + loc_{} + {};", i, j, value, targ, slot),
-          );
-        }
-      }
-    }
-  }
-  match elem {
-    bd::Elem::Fix { value } => format!("{}u", value),
-    bd::Elem::Ext { index } => get_var(&vars[*index as usize]),
-    bd::Elem::Loc { value, targ, slot } => format!("({}u + loc_{} + {})", value, targ, slot),
-  }
+  let mut globs: HashMap<u64, String> = HashMap::new();
+  compile_term(code, tab, &mut vars, &mut nams, &mut globs, term)
 }
 
 fn get_var(var: &bd::DynVar) -> String {
@@ -455,61 +433,74 @@ fn line(code: &mut String, tab: u64, line: &str) {
   code.push('\n');
 }
 
-pub fn c_runtime_template(
+/// String pattern that will be replaced on the template code.
+/// Syntax:
+/// ```c
+/// /*! <TAG> !*/
+/// ```
+/// or:
+/// ```c
+/// /*! <TAG> */ ... /* <TAG> !*/
+/// ```
+// Note: `(?s)` is the flag that allows `.` to match `\n`
+const REPLACEMENT_TOKEN_PATTERN: &str =
+  r"(?s)(?:/\*! *(\w+?) *!\*/)|(?:/\*! *(\w+?) *\*/.+?/\* *(\w+?) *!\*/)";
+
+fn c_runtime_template(
   c_ids: &str,
   inits: &str,
   codes: &str,
   id2nm: &str,
   names_count: u64,
+  parallel: bool,
 ) -> String {
   const C_RUNTIME_TEMPLATE: &str = include_str!("runtime.c");
-  const C_CONSTRUCTOR_IDS_CONTENT: &str = "/* GENERATED_CONSTRUCTOR_IDS_CONTENT */";
-  const C_REWRITE_RULES_STEP_0_CONTENT: &str = "/* GENERATED_REWRITE_RULES_STEP_0_CONTENT */";
-  const C_REWRITE_RULES_STEP_1_CONTENT: &str = "/* GENERATED_REWRITE_RULES_STEP_1_CONTENT */";
-  const C_NAME_COUNT_CONTENT: &str = "/* GENERATED_NAME_COUNT_CONTENT */";
-  const C_ID_TO_NAME_DATA_CONTENT: &str = "/* GENERATED_ID_TO_NAME_DATA_CONTENT */";
-  const C_NUM_THREADS_CONTENT: &str = "/* GENERATED_NUM_THREADS_CONTENT */";
+  // Instantiate the template with the given sections' content
 
-  // Sanity checks: the generated section tokens we're looking for must be present in the runtime C
-  // file.
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_CONSTRUCTOR_IDS_CONTENT),
-    "The runtime C file is missing the constructor ids section token: {}",
-    C_CONSTRUCTOR_IDS_CONTENT
-  );
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_REWRITE_RULES_STEP_0_CONTENT),
-    "The runtime C file is missing the rewrite rules step 0 section token: {}",
-    C_REWRITE_RULES_STEP_0_CONTENT
-  );
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_REWRITE_RULES_STEP_1_CONTENT),
-    "The runtime C file is missing the rewrite rules step 1 section token: {}",
-    C_REWRITE_RULES_STEP_1_CONTENT
-  );
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_NAME_COUNT_CONTENT),
-    "The runtime C file is missing name count section token: {}",
-    C_NAME_COUNT_CONTENT
-  );
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_ID_TO_NAME_DATA_CONTENT),
-    "The runtime C file is missing the id to name data section token: {}",
-    C_ID_TO_NAME_DATA_CONTENT
-  );
-  debug_assert!(
-    C_RUNTIME_TEMPLATE.contains(C_NUM_THREADS_CONTENT),
-    "The runtime C file is missing the num threads section token: {}",
-    C_NUM_THREADS_CONTENT
-  );
+  const C_PARALLEL_FLAG_TAG: &str = "GENERATED_PARALLEL_FLAG";
+  const C_NUM_THREADS_TAG: &str = "GENERATED_NUM_THREADS";
+  const C_CONSTRUCTOR_IDS_TAG: &str = "GENERATED_CONSTRUCTOR_IDS";
+  const C_REWRITE_RULES_STEP_0_TAG: &str = "GENERATED_REWRITE_RULES_STEP_0";
+  const C_REWRITE_RULES_STEP_1_TAG: &str = "GENERATED_REWRITE_RULES_STEP_1";
+  const C_NAME_COUNT_TAG: &str = "GENERATED_NAME_COUNT";
+  const C_ID_TO_NAME_DATA_TAG: &str = "GENERATED_ID_TO_NAME_DATA";
+
+  // TODO: Sanity checks: all tokens we're looking for must be present in the
+  // `runtime.c` file.
+
+  let re = Regex::new(REPLACEMENT_TOKEN_PATTERN).unwrap();
 
   // Instantiate the template with the given sections' content
 
-  C_RUNTIME_TEMPLATE
-    .replace(C_NUM_THREADS_CONTENT, &num_cpus::get().to_string())
-    .replace(C_CONSTRUCTOR_IDS_CONTENT, c_ids)
-    .replace(C_REWRITE_RULES_STEP_0_CONTENT, inits)
-    .replace(C_REWRITE_RULES_STEP_1_CONTENT, codes)
-    .replace(C_NAME_COUNT_CONTENT, &names_count.to_string())
-    .replace(C_ID_TO_NAME_DATA_CONTENT, id2nm)
+  let result = re.replace_all(C_RUNTIME_TEMPLATE, |caps: &regex::Captures| {
+    let tag = if let Some(cap1) = caps.get(1) {
+      cap1.as_str()
+    } else if let Some(cap2) = caps.get(2) {
+      let cap2 = cap2.as_str();
+      if let Some(cap3) = caps.get(3) {
+        let cap3 = cap3.as_str();
+        debug_assert!(cap2 == cap3, "Closing block tag name must match opening tag: {}.", cap2);
+      }
+      cap2
+    } else {
+      panic!("Replacement token must have a tag.")
+    };
+
+    let parallel_flag = if parallel { "#define PARALLEL" } else { "" };
+    let num_threads = &num_cpus::get().to_string();
+    let names_count = &names_count.to_string();
+    match tag {
+      C_PARALLEL_FLAG_TAG => parallel_flag,
+      C_NUM_THREADS_TAG => num_threads,
+      C_CONSTRUCTOR_IDS_TAG => c_ids,
+      C_REWRITE_RULES_STEP_0_TAG => inits,
+      C_REWRITE_RULES_STEP_1_TAG => codes,
+      C_NAME_COUNT_TAG => names_count,
+      C_ID_TO_NAME_DATA_TAG => id2nm,
+      _ => panic!("Unknown replacement tag."),
+    }
+    .to_string()
+  });
+
+  (*result).to_string()
 }

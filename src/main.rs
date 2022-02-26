@@ -6,43 +6,49 @@ mod readback;
 mod rulebook;
 mod runtime;
 
-fn main() -> std::io::Result<()> {
-  run_cli()?;
-  //run_example()?;
-  Ok(())
+fn main() {
+  //match run_example() {
+  match run_cli() {
+    Ok(..) => {},
+    Err(err) => {
+      eprintln!("{}", err);
+    }
+  };
 }
 
-fn run_cli() -> std::io::Result<()> {
+fn run_cli() -> Result<(), String> {
   let args: Vec<String> = std::env::args().collect();
 
   fn hvm(file: &str) -> String {
-    if !file.ends_with(".hvm") {
-      format!("{}.hvm", file)
-    } else {
+    if file.ends_with(".hvm") {
       file.to_string()
+    } else {
+      format!("{}.hvm", file)
     }
   }
 
-  if args.len() <= 1 {
-    show_help();
-    return Ok(());
+  let cmd = match &args[..] {
+    [] | [_] => {
+      show_help();
+      return Ok(());
+    }
+    [_, c, ..] => c.as_str(),
+  };
+
+  if matches!(cmd, "d" | "debug") && args.len() >= 3 {
+    let file = &hvm(&args[2]);
+    return run_code(&load_file_code(file)?, true);
   }
 
-  let cmd = &args[1];
-
-  if (cmd == "d" || cmd == "debug") && args.len() >= 3 {
+  if matches!(cmd, "r" | "run") && args.len() >= 3 {
     let file = &hvm(&args[2]);
-    return run_code(&load_file_code(file), true);
+    return run_code(&load_file_code(file)?, false);
   }
 
-  if (cmd == "r" || cmd == "run") && args.len() >= 3 {
+  if matches!(cmd, "c" | "compile") && args.len() >= 3 {
     let file = &hvm(&args[2]);
-    return run_code(&load_file_code(file), false);
-  }
-
-  if (cmd == "c" || cmd == "compile") && args.len() >= 3 {
-    let file = &hvm(&args[2]);
-    return compile_code(&load_file_code(file), file);
+    let parallel = !(args.len() >= 4 && args[3] == "--single-thread");
+    return compile_code(&load_file_code(file)?, file, parallel);
   }
 
   println!("Invalid arguments: {:?}.", args);
@@ -63,22 +69,26 @@ fn show_help() {
   println!();
   println!("To compile a file to C:");
   println!();
-  println!("  hvm c file.hvm");
+  println!("  hvm c file.hvm [--single-thread]");
   println!();
   println!("This is a PROTOTYPE. Report bugs on https://github.com/Kindelia/HVM/issues!");
   println!();
 }
 
-fn make_call() -> language::Term {
+fn make_call() -> Result<language::Term, String> {
   let pars = &std::env::args().collect::<Vec<String>>()[3..];
   let name = "Main".to_string();
-  let args = pars.iter().map(|par| language::read_term(par)).collect();
-  language::Term::Ctr { name, args }
+  let mut args = Vec::new();
+  for par in pars {
+    let term = language::read_term(par)?;
+    args.push(term);
+  }
+  Ok(language::Term::Ctr { name, args })
 }
 
-fn run_code(code: &str, debug: bool) -> std::io::Result<()> {
-  println!("Reducing.");
-  let (norm, cost, size, time) = builder::eval_code(&make_call(), code, debug);
+fn run_code(code: &str, debug: bool) -> Result<(), String> {
+  let call = make_call()?;
+  let (norm, cost, size, time) = builder::eval_code(&call, code, debug)?;
   println!("Rewrites: {} ({:.2} MR/s)", cost, (cost as f64) / (time as f64) / 1000.0);
   println!("Mem.Size: {}", size);
   println!();
@@ -86,23 +96,22 @@ fn run_code(code: &str, debug: bool) -> std::io::Result<()> {
   Ok(())
 }
 
-fn compile_code(code: &str, name: &str) -> std::io::Result<()> {
+fn compile_code(code: &str, name: &str, parallel: bool) -> Result<(), String> {
   if !name.ends_with(".hvm") {
-    panic!("Input file must end with .hvm.");
+    return Err("Input file must end with .hvm.".to_string());
   }
   let name = format!("{}.c", &name[0..name.len() - 4]);
-  compiler::compile_code_and_save(code, &name)?;
+  compiler::compile_code_and_save(code, &name, parallel)?;
   println!("Compiled to '{}'.", name);
   Ok(())
 }
 
-fn load_file_code(file_name: &str) -> String {
-  std::fs::read_to_string(file_name)
-    .unwrap_or_else(|_| panic!("Error reading file: '{}'.", file_name))
+fn load_file_code(file_name: &str) -> Result<String, String> {
+  std::fs::read_to_string(file_name).map_err(|err| err.to_string())
 }
 
 #[allow(dead_code)]
-fn run_example() -> std::io::Result<()> {
+fn run_example() -> Result<(), String> {
   // Source code
   let _code = "(Main) = (λf λx (f (f x)) λf λx (f (f x)))";
 
@@ -149,19 +158,17 @@ fn run_example() -> std::io::Result<()> {
   ";
 
   // Compiles to C and saves as 'main.c'
-  compiler::compile_code_and_save(code, "main.c")?;
+  compiler::compile_code_and_save(code, "main.c", true)?;
   println!("Compiled to 'main.c'.");
 
   // Evaluates with interpreter
 
   println!("Reducing with interpreter.");
   let call = language::Term::Ctr { name: "Main".to_string(), args: Vec::new() };
-  let (norm, cost, size, time) = builder::eval_code(&call, code, false);
+  let (norm, cost, size, time) = builder::eval_code(&call, code, false)?;
   println!("Rewrites: {} ({:.2} MR/s)", cost, (cost as f64) / (time as f64) / 1000.0);
   println!("Mem.Size: {}", size);
   println!();
   println!("{}", norm);
-  println!();
-
   Ok(())
 }

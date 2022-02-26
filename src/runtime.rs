@@ -59,7 +59,7 @@ pub const NEQ: u64 = 0xF;
 
 pub type Lnk = u64;
 
-pub type Rewriter = Box<dyn Fn(&mut Worker, u64, Lnk) -> bool>;
+pub type Rewriter = Box<dyn Fn(&mut Worker, &mut u64, u64, Lnk) -> bool>;
 
 pub struct Function {
   pub arity: u64,
@@ -75,7 +75,12 @@ pub struct Worker {
 }
 
 pub fn new_worker() -> Worker {
-  Worker { node: vec![0; 6 * 0x8000000], size: 0, free: vec![vec![]; 16], cost: 0 }
+  Worker {
+    node: vec![0; 6 * 0x8000000],
+    size: 0,
+    free: vec![vec![]; 16],
+    cost: 0
+  }
 }
 
 // Globals
@@ -169,10 +174,8 @@ pub fn get_loc(lnk: Lnk, arg: u64) -> u64 {
 // ------
 
 pub fn ask_lnk(mem: &Worker, loc: u64) -> Lnk {
-  unsafe {
-    return *mem.node.get_unchecked(loc as usize);
-  }
-  //return mem.node[loc as usize];
+  unsafe { *mem.node.get_unchecked(loc as usize) }
+  // mem.node[loc as usize]
 }
 
 pub fn ask_arg(mem: &Worker, term: Lnk, arg: u64) -> Lnk {
@@ -196,10 +199,9 @@ pub fn link(mem: &mut Worker, loc: u64, lnk: Lnk) -> Lnk {
 pub fn alloc(mem: &mut Worker, size: u64) -> u64 {
   if size == 0 {
     0
+  } else if let Some(reuse) = mem.free[size as usize].pop() {
+    reuse
   } else {
-    if let Some(reuse) = mem.free[size as usize].pop() {
-      return reuse;
-    }
     let loc = mem.size;
     mem.size += size;
     loc
@@ -299,6 +301,7 @@ pub fn cal_par(mem: &mut Worker, host: u64, term: Lnk, argn: Lnk, n: u64) -> Lnk
 
 pub fn reduce(
   mem: &mut Worker,
+  dups: &mut u64,
   funcs: &[Option<Function>],
   root: u64,
   _opt_id_to_name: Option<&HashMap<u64, String>>,
@@ -394,13 +397,13 @@ pub fn reduce(
         }
         DP0 | DP1 => {
           let arg0 = ask_arg(mem, term, 2);
-          //let argK = ask_arg(mem, term, if get_tag(term) == DP0 { 1 } else { 0 });
-          //if get_tag(argK) == ERA {
-            //let done = arg0;
-            //link(mem, host, done);
-            //init = 1;
-            //continue;
-          //}
+          // let argK = ask_arg(mem, term, if get_tag(term) == DP0 { 1 } else { 0 });
+          // if get_tag(argK) == ERA {
+          //   let done = arg0;
+          //   link(mem, host, done);
+          //   init = 1;
+          //   continue;
+          // }
           if get_tag(arg0) == LAM {
             //println!("dup-lam");
             inc_cost(mem);
@@ -512,48 +515,12 @@ pub fn reduce(
               XOR => (a ^ b) & 0xFFFFFFFF,
               SHL => (a << b) & 0xFFFFFFFF,
               SHR => (a >> b) & 0xFFFFFFFF,
-              LTN => {
-                if a < b {
-                  1
-                } else {
-                  0
-                }
-              }
-              LTE => {
-                if a <= b {
-                  1
-                } else {
-                  0
-                }
-              }
-              EQL => {
-                if a == b {
-                  1
-                } else {
-                  0
-                }
-              }
-              GTE => {
-                if a >= b {
-                  1
-                } else {
-                  0
-                }
-              }
-              GTN => {
-                if a > b {
-                  1
-                } else {
-                  0
-                }
-              }
-              NEQ => {
-                if a != b {
-                  1
-                } else {
-                  0
-                }
-              }
+              LTN => u64::from(a < b),
+              LTE => u64::from(a <= b),
+              EQL => u64::from(a == b),
+              GTE => u64::from(a >= b),
+              GTN => u64::from(a > b),
+              NEQ => u64::from(a != b),
               _ => 0,
             };
             let done = U_32(c);
@@ -597,7 +564,7 @@ pub fn reduce(
           let fun = get_ext(term);
           let _ari = get_ari(term);
           if let Some(f) = &funcs[fun as usize] {
-            if (f.rewriter)(mem, host, term) {
+            if (f.rewriter)(mem, dups, host, term) {
               //println!("cal-fun");
               init = 1;
               continue;
@@ -630,6 +597,7 @@ pub fn get_bit(bits: &[u64], bit: u64) -> bool {
 
 pub fn normal_go(
   mem: &mut Worker,
+  dups: &mut u64,
   funcs: &[Option<Function>],
   host: u64,
   seen: &mut [u64],
@@ -640,7 +608,7 @@ pub fn normal_go(
   if get_bit(seen, host) {
     term
   } else {
-    let term = reduce(mem, funcs, host, opt_id_to_name, debug);
+    let term = reduce(mem, dups, funcs, host, opt_id_to_name, debug);
     set_bit(seen, host);
     let mut rec_locs = Vec::with_capacity(16);
     match get_tag(term) {
@@ -670,7 +638,7 @@ pub fn normal_go(
       _ => {}
     }
     for loc in rec_locs {
-      let lnk: Lnk = normal_go(mem, funcs, loc, seen, opt_id_to_name, debug);
+      let lnk: Lnk = normal_go(mem, dups, funcs, loc, seen, opt_id_to_name, debug);
       link(mem, loc, lnk);
     }
     term
@@ -685,7 +653,8 @@ pub fn normal(
   debug: bool,
 ) -> Lnk {
   let mut seen = vec![0; 4194304];
-  normal_go(mem, funcs, host, &mut seen, opt_id_to_name, debug)
+  let mut dups = 0;
+  normal_go(mem, &mut dups, funcs, host, &mut seen, opt_id_to_name, debug)
 }
 
 // Debug
@@ -736,7 +705,12 @@ pub fn show_mem(worker: &Worker) -> String {
   s
 }
 
-pub fn show_term(mem: &Worker, term: Lnk, opt_id_to_name: Option<&HashMap<u64, String>>, focus: u64) -> String {
+pub fn show_term(
+  mem: &Worker,
+  term: Lnk,
+  opt_id_to_name: Option<&HashMap<u64, String>>,
+  focus: u64,
+) -> String {
   let mut lets: HashMap<u64, u64> = HashMap::new();
   let mut kinds: HashMap<u64, u64> = HashMap::new();
   let mut names: HashMap<u64, String> = HashMap::new();
@@ -831,23 +805,23 @@ pub fn show_term(mem: &Worker, term: Lnk, opt_id_to_name: Option<&HashMap<u64, S
         let val0 = go(mem, ask_arg(mem, term, 0), names, opt_id_to_name, focus);
         let val1 = go(mem, ask_arg(mem, term, 1), names, opt_id_to_name, focus);
         let symb = match oper {
-          0x00 => "+",
-          0x01 => "-",
-          0x02 => "*",
-          0x03 => "/",
-          0x04 => "%",
-          0x05 => "&",
-          0x06 => "|",
-          0x07 => "^",
-          0x08 => "<<",
-          0x09 => ">>",
-          0x10 => "<",
-          0x11 => "<=",
-          0x12 => "=",
-          0x13 => ">=",
-          0x14 => ">",
-          0x15 => "!=",
-          _ => "?",
+          0x0 => "+",
+          0x1 => "-",
+          0x2 => "*",
+          0x3 => "/",
+          0x4 => "%",
+          0x5 => "&",
+          0x6 => "|",
+          0x7 => "^",
+          0x8 => "<<",
+          0x9 => ">>",
+          0xA => "<",
+          0xB => "<=",
+          0xC => "=",
+          0xD => ">=",
+          0xE => ">",
+          0xF => "!=",
+          _   => "?",
         };
         format!("({} {} {})", symb, val0, val1)
       }
@@ -873,10 +847,10 @@ pub fn show_term(mem: &Worker, term: Lnk, opt_id_to_name: Option<&HashMap<u64, S
       _ => String::from("?"),
     };
     if term == focus {
-      return format!("${}", done);
+      format!("${}", done)
     } else {
-      return done;
-    };
+      done
+    }
   }
   find_lets(mem, term, &mut lets, &mut kinds, &mut names, &mut count);
   let mut text = go(mem, term, &names, opt_id_to_name, focus);
@@ -885,8 +859,10 @@ pub fn show_term(mem: &Worker, term: Lnk, opt_id_to_name: Option<&HashMap<u64, S
     let what = String::from("?");
     //let kind = kinds.get(&key).unwrap_or(&0);
     let name = names.get(&pos).unwrap_or(&what);
-    let nam0 = if ask_lnk(mem, pos + 0) == Era() { String::from("*") } else { format!("a{}", name) };
-    let nam1 = if ask_lnk(mem, pos + 1) == Era() { String::from("*") } else { format!("b{}", name) };
+    let nam0 =
+      if ask_lnk(mem, pos + 0) == Era() { String::from("*") } else { format!("a{}", name) };
+    let nam1 =
+      if ask_lnk(mem, pos + 1) == Era() { String::from("*") } else { format!("b{}", name) };
     text.push_str(&format!(
       "\ndup {} {} = {};",
       //kind,

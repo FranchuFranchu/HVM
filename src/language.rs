@@ -33,8 +33,8 @@ pub enum Oper {
   Xor,
   Shl,
   Shr,
-  Ltn,
   Lte,
+  Ltn,
   Eql,
   Gte,
   Gtn,
@@ -79,8 +79,8 @@ impl fmt::Display for Oper {
         Self::Xor => "^",
         Self::Shl => "<<",
         Self::Shr => ">>",
-        Self::Ltn => "<",
         Self::Lte => "<=",
+        Self::Ltn => "<",
         Self::Eql => "==",
         Self::Gte => ">=",
         Self::Gtn => ">",
@@ -94,6 +94,28 @@ impl fmt::Display for Term {
   // WARN: I think this could overflow, might need to rewrite it to be iterative instead of recursive?
   // NOTE: Another issue is complexity. This function is O(N^2). Should use ropes to be linear.
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn lst_sugar(term: &Term) -> Option<String> {
+      fn go(term: &Term, text: &mut String, fst: bool) -> Option<()> {
+        if let Term::Ctr { name, args } = term {
+          if name == "Cons" && args.len() == 2 {
+            text.push(if fst {'\0'} else {','});
+            text.push_str(&format!("{}", args[0]));
+            go(&args[1], text, false)?;
+            return Some(());
+          }
+          if name == "Nil" && args.is_empty() {
+            return Some(());
+          }
+        }
+        None
+      }
+      let mut result = String::new();
+      result.push('[');
+      go(term, &mut result, true)?;
+      result.push(']');
+      Some(result)
+    }
+
     fn str_sugar(term: &Term) -> Option<String> {
       fn go(term: &Term, text: &mut String) -> Option<()> {
         if let Term::Ctr { name, args } = term {
@@ -125,11 +147,15 @@ impl fmt::Display for Term {
       Self::Lam { name, body } => write!(f, "λ{} {}", name, body),
       Self::App { func, argm } => write!(f, "({} {})", func, argm),
       Self::Ctr { name, args } => {
-        if let Some(term) = str_sugar(self) {
-          write!(f, "{}", term)
-        } else {
-          write!(f, "({}{})", name, args.iter().map(|x| format!(" {}", x)).collect::<String>())
+        // Ctr sugars
+        let sugars = [str_sugar, lst_sugar];
+        for sugar in sugars {
+          if let Some(term) = sugar(self) {
+            return write!(f, "{}", term)
+          }
         }
+        
+        write!(f, "({}{})", name, args.iter().map(|x| format!(" {}", x)).collect::<String>())
       }
       Self::U32 { numb } => write!(f, "{}", numb),
       Self::Op2 { oper, val0, val1 } => write!(f, "({} {} {})", oper, val0, val1),
@@ -196,30 +222,18 @@ pub fn parse_dup(state: parser::State) -> parser::Answer<Option<BTerm>> {
 }
 
 pub fn parse_lam(state: parser::State) -> parser::Answer<Option<BTerm>> {
-  return parser::guard(
-    parser::text_parser("λ"),
-    Box::new(|state| {
-      let (state, _) = parser::text("λ", state)?;
+  let parse_symbol =
+    |x| parser::parser_or(&[parser::text_parser("λ"), parser::text_parser("@")], x);
+  parser::guard(
+    Box::new(parse_symbol),
+    Box::new(move |state| {
+      let (state, _) = parse_symbol(state)?;
       let (state, name) = parser::name(state)?;
       let (state, body) = parse_term(state)?;
       Ok((state, Box::new(Term::Lam { name, body })))
     }),
     state,
-  );
-}
-
-// TODO: move this to parse_lam to avoid duplicated code
-pub fn parse_lam_ugly(state: parser::State) -> parser::Answer<Option<BTerm>> {
-  return parser::guard(
-    parser::text_parser("@"),
-    Box::new(|state| {
-      let (state, _) = parser::text("@", state)?;
-      let (state, name) = parser::name(state)?;
-      let (state, body) = parse_term(state)?;
-      Ok((state, Box::new(Term::Lam { name, body })))
-    }),
-    state,
-  );
+  )
 }
 
 pub fn parse_app(state: parser::State) -> parser::Answer<Option<BTerm>> {
@@ -250,7 +264,7 @@ pub fn parse_ctr(state: parser::State) -> parser::Answer<Option<BTerm>> {
     Box::new(|state| {
       let (state, _) = parser::text("(", state)?;
       let (state, head) = parser::get_char(state)?;
-      Ok((state, ('A'..='Z').contains(&head) || head == '.'))
+      Ok((state, ('A'..='Z').contains(&head)))
     }),
     Box::new(|state| {
       let (state, open) = parser::text("(", state)?;
@@ -286,19 +300,7 @@ pub fn parse_u32(state: parser::State) -> parser::Answer<Option<BTerm>> {
 
 pub fn parse_op2(state: parser::State) -> parser::Answer<Option<BTerm>> {
   fn is_op_char(chr: char) -> bool {
-    false
-      || chr == '+'
-      || chr == '-'
-      || chr == '*'
-      || chr == '/'
-      || chr == '%'
-      || chr == '&'
-      || chr == '|'
-      || chr == '^'
-      || chr == '<'
-      || chr == '>'
-      || chr == '='
-      || chr == '!'
+    matches!(chr, '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '<' | '>' | '=' | '!')
   }
   fn parse_oper(state: parser::State) -> parser::Answer<Oper> {
     fn op<'a>(symbol: &'static str, oper: Oper) -> parser::Parser<'a, Option<Oper>> {
@@ -320,8 +322,8 @@ pub fn parse_op2(state: parser::State) -> parser::Answer<Option<BTerm>> {
         op("^", Oper::Xor),
         op("<<", Oper::Shl),
         op(">>", Oper::Shr),
-        op("<", Oper::Ltn),
         op("<=", Oper::Lte),
+        op("<", Oper::Ltn),
         op("==", Oper::Eql),
         op(">=", Oper::Gte),
         op(">", Oper::Gtn),
@@ -352,11 +354,31 @@ pub fn parse_var(state: parser::State) -> parser::Answer<Option<BTerm>> {
   parser::guard(
     Box::new(|state| {
       let (state, head) = parser::get_char(state)?;
-      Ok((state, ('a'..='z').contains(&head) || head == '_'))
+      Ok((state, ('a'..='z').contains(&head) || head == '_' || head == '$'))
     }),
     Box::new(|state| {
       let (state, name) = parser::name(state)?;
       Ok((state, Box::new(Term::Var { name })))
+    }),
+    state,
+  )
+}
+
+pub fn parse_chr_sugar(state: parser::State) -> parser::Answer<Option<BTerm>> {
+  parser::guard(
+    Box::new(|state| {
+      let (state, head) = parser::get_char(state)?;
+      Ok((state, head == '\''))
+    }),
+    Box::new(|state| {
+      let (state, _) = parser::text("'", state)?;
+      if let Some(c) = parser::head(state) {
+        let state      = parser::tail(state);
+        let (state, _) = parser::text("'", state)?;
+        Ok((state, Box::new(Term::U32{numb: c as u32})))
+      } else {
+        parser::expected("character", 1, state)
+      }
     }),
     state,
   )
@@ -374,13 +396,14 @@ pub fn parse_str_sugar(state: parser::State) -> parser::Answer<Option<BTerm>> {
       let mut chars: Vec<char> = Vec::new();
       let mut state = state;
       loop {
-        let (new_state, next) = parser::get_char(state)?;
-        if next == '"' || next == '\0' {
-          state = new_state;
-          break;
-        } else {
-          chars.push(next);
-          state = new_state;
+        if let Some(next) = parser::head(state) {
+          if next == '"' || next == '\0' {
+            state = parser::tail(state);
+            break;
+          } else {
+            chars.push(next);
+            state = parser::tail(state);
+          }
         }
       }
       let empty = Term::Ctr { name: "StrNil".to_string(), args: Vec::new() };
@@ -404,15 +427,15 @@ pub fn parse_lst_sugar(state: parser::State) -> parser::Answer<Option<BTerm>> {
       let (state, _head) = parser::text("[", state)?;
       // let mut elems: Vec<Box<Term>> = Vec::new();
       let state = state;
-      let (state, elems) = 
-        parser::until(
-    Box::new(|x| parser::text("]", x)), 
-   Box::new(|x| { 
-            let (state, term) = parse_term(x)?;
-            let (state, _) = parser::maybe(Box::new(|x| parser::text(",", x)), state)?;
-            Ok((state, term))
-          })
-          , state)?;
+      let (state, elems) = parser::until(
+        Box::new(|x| parser::text("]", x)),
+        Box::new(|x| {
+          let (state, term) = parse_term(x)?;
+          let (state, _) = parser::maybe(Box::new(|x| parser::text(",", x)), state)?;
+          Ok((state, term))
+        }),
+        state,
+      )?;
       let empty = Term::Ctr { name: "Nil".to_string(), args: Vec::new() };
       let list = Box::new(elems.iter().rfold(empty, |t, h| Term::Ctr {
         name: "Cons".to_string(),
@@ -431,11 +454,11 @@ pub fn parse_term(state: parser::State) -> parser::Answer<BTerm> {
       Box::new(parse_let),
       Box::new(parse_dup),
       Box::new(parse_lam),
-      Box::new(parse_lam_ugly),
       Box::new(parse_ctr),
       Box::new(parse_op2),
       Box::new(parse_app),
       Box::new(parse_u32),
+      Box::new(parse_chr_sugar),
       Box::new(parse_str_sugar),
       Box::new(parse_lst_sugar),
       Box::new(parse_var),
@@ -478,15 +501,15 @@ pub fn parse_file(state: parser::State) -> parser::Answer<File> {
   Ok((state, File { rules }))
 }
 
-pub fn read_term(code: &str) -> Box<Term> {
+pub fn read_term(code: &str) -> Result<Box<Term>, String> {
   parser::read(Box::new(parse_term), code)
 }
 
-pub fn read_file(code: &str) -> File {
+pub fn read_file(code: &str) -> Result<File, String> {
   parser::read(Box::new(parse_file), code)
 }
 
 #[allow(dead_code)]
-pub fn read_rule(code: &str) -> Option<Rule> {
+pub fn read_rule(code: &str) -> Result<Option<Rule>, String> {
   parser::read(Box::new(parse_rule), code)
 }
