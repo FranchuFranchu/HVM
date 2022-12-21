@@ -46,6 +46,7 @@ pub const HVM_PRINT : u64 = 26;
 pub const HVM_SLEEP : u64 = 27;
 pub const HVM_STORE : u64 = 28;
 pub const HVM_LOAD : u64 = 29;
+pub const HVM_NODE_ID : u64 = 30;
 //[[CODEGEN:PRECOMP-IDS]]//
 
 pub const PRECOMP : &[Precomp] = &[
@@ -251,6 +252,15 @@ pub const PRECOMP : &[Precomp] = &[
     funs: Some(PrecompFuns {
       visit: hvm_load_visit,
       apply: hvm_load_apply,
+    }),
+  },
+  Precomp {
+    id: HVM_NODE_ID,
+    name: "HVM.node_id",
+    smap: &[false; 1],
+    funs: Some(PrecompFuns {
+      visit: hvm_node_id_visit,
+      apply: hvm_node_id_apply,
     }),
   },
 //[[CODEGEN:PRECOMP-ELS]]//
@@ -478,6 +488,24 @@ fn hvm_load_apply(ctx: ReduceCtx) -> bool {
   }
   println!("Runtime failure on: {}", show_at(ctx.heap, ctx.prog, *ctx.host, &[]));
   std::process::exit(0);
+}
+
+// HVM.node_id (cont: U60 -> Term)
+// ---------------------------------------------
+fn hvm_node_id_visit(ctx: ReduceCtx) -> bool {
+  return false;
+}
+
+fn hvm_node_id_apply(ctx: ReduceCtx) -> bool {
+  let cont = load_arg(ctx.heap, ctx.term, 0); 
+  
+  let app0 = alloc(ctx.heap, ctx.tid, 2);
+  let text = U6O(app0);
+  link(ctx.heap, app0 + 0, cont);
+  link(ctx.heap, app0 + 1, text);
+  let done = App(app0);
+  link(ctx.heap, *ctx.host, done);
+  return true;
 }
 
 //[[CODEGEN:PRECOMP-FNS]]//
